@@ -11,10 +11,19 @@
   button:hover { background: #45a049; }
   button.stop { background: #f44336; }
   button.stop:hover { background: #da190b; }
-  #webcam-container { margin-top: 10px; }
+  button.calibrate { background: #ff9800; }
+  button.calibrate:hover { background: #f57c00; }
+  #webcam-container { margin-top: 10px; position: relative; }
   video, canvas { max-width: 100%; height: auto; }
-  #label-container div { font-size: 1.2em; margin-top: 5px; }
+  #overlay { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); 
+             background: rgba(0,0,0,0.7); color: white; padding: 20px; border-radius: 10px;
+             font-size: 1.5em; display: none; }
+  #label-container div { font-size: 1.2em; margin-top: 5px; padding: 5px; }
   #status { margin: 10px; padding: 10px; background: #fff; border-radius: 5px; }
+  .highlight { font-weight: bold; color: #2196f3; background: #e3f2fd; }
+  #debug { margin: 10px; padding: 10px; background: #fff3cd; border-radius: 5px; font-family: monospace; font-size: 0.9em; }
+  .waiting { background: #ffeaa7 !important; }
+  .detecting { background: #55efc4 !important; }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest"></script>
 </head>
@@ -22,25 +31,53 @@
 <h2>Smart Trash Sorter → ESP32</h2>
 <div id="status">Loading model...</div>
 <button id="startBtn">Start Camera & Model</button>
+<button id="calibrateBtn" class="calibrate" style="display:none;">Calibrate Background</button>
 <button id="bleBtn">Connect to ESP32</button>
 <button id="stopBtn" class="stop">Stop & Disconnect</button>
-<div id="webcam-container"></div>
+<div id="webcam-container">
+  <div id="overlay">📷 Waiting for object...</div>
+</div>
 <div id="label-container"></div>
+<div id="debug">Debug: Waiting...</div>
 <script>
 window.onload = function() {
     // UPDATE THIS PATH to where you host your web_model folder
-    const MODEL_URL = "web_model/model.json"; 
+    const MODEL_URL = "./web_model/model.json"; 
     
     // Define your class labels (must match the order your model was trained with)
     const CLASS_LABELS = ["cardboard", "glass", "metal", "paper", "plastic", "trash"];
+    
+    // ===== DETECTION SETTINGS (ADJUST THESE) =====
+    const CHANGE_THRESHOLD = 15;        // Minimum pixel difference to detect object (0-255)
+    const CHANGE_PERCENTAGE = 15;       // Minimum % of pixels that must change (0-100)
+    const STABLE_FRAMES_REQUIRED = 5;   // Frames object must be stable before prediction
+    const CONFIDENCE_THRESHOLD = 0.6;   // Minimum confidence to send to ESP32 (0-1)
+    const BACKGROUND_CALIBRATION_FRAMES = 10; // Frames to average for background
+    // =============================================
     
     let model, webcam, labelContainer;
     let bleDevice, bleCharacteristic;
     let animationId = null;
     let videoElement;
     let statusDiv = document.getElementById("status");
+    let debugDiv = document.getElementById("debug");
+    let overlayDiv = document.getElementById("overlay");
+    let calibrateBtn = document.getElementById("calibrateBtn");
+    
+    let lastSentCommand = "";
+    let lastSentTime = 0;
+    let frameCount = 0;
+    
+    // Background detection variables
+    let backgroundFrame = null;
+    let calibrating = false;
+    let calibrationFrames = [];
+    let objectPresent = false;
+    let stableFrameCount = 0;
+    let lastPrediction = null;
     
     document.getElementById("startBtn").onclick = init;
+    document.getElementById("calibrateBtn").onclick = calibrateBackground;
     document.getElementById("bleBtn").onclick = connectBLE;
     document.getElementById("stopBtn").onclick = stopAll;
     
@@ -104,10 +141,19 @@ window.onload = function() {
                 labelContainer.appendChild(document.createElement("div"));
             }
             
-            statusDiv.innerHTML = "Camera started! Predicting...";
+            statusDiv.innerHTML = "Calibrating background... Keep camera still!";
+            statusDiv.style.background = "#fff3cd";
+            
+            // Show calibrate button
+            calibrateBtn.style.display = "inline-block";
+            
+            // Auto-calibrate background on start
+            await calibrateBackground();
+            
+            statusDiv.innerHTML = "Ready! Place object in front of camera.";
             statusDiv.style.background = "#d4edda";
             
-            // Start prediction loop
+            // Start detection loop
             loop();
         } catch (err) {
             alert("Error starting camera: " + err.message);
@@ -117,39 +163,174 @@ window.onload = function() {
         }
     }
     
+    async function calibrateBackground() {
+        if (!videoElement || calibrating) return;
+        
+        calibrating = true;
+        calibrationFrames = [];
+        statusDiv.innerHTML = "Calibrating... Keep camera still!";
+        statusDiv.style.background = "#fff3cd";
+        statusDiv.className = "waiting";
+        overlayDiv.style.display = "block";
+        overlayDiv.innerHTML = "📷 Calibrating...<br>Keep camera still!";
+        
+        debugDiv.innerHTML = "Debug: Calibrating background...";
+        
+        // Capture multiple frames and average them
+        for (let i = 0; i < BACKGROUND_CALIBRATION_FRAMES; i++) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+            
+            if (videoElement.readyState === videoElement.HAVE_ENOUGH_DATA) {
+                const frameTensor = tf.browser.fromPixels(videoElement)
+                    .resizeNearestNeighbor([224, 224]);
+                calibrationFrames.push(frameTensor);
+            }
+        }
+        
+        // Average all frames
+        if (calibrationFrames.length > 0) {
+            backgroundFrame = tf.stack(calibrationFrames).mean(0);
+            // Clean up individual frames
+            calibrationFrames.forEach(frame => frame.dispose());
+            calibrationFrames = [];
+        }
+        
+        calibrating = false;
+        statusDiv.innerHTML = "Background calibrated! Place object to scan.";
+        statusDiv.style.background = "#d4edda";
+        overlayDiv.innerHTML = "📷 Waiting for object...";
+        debugDiv.innerHTML = "Debug: Background calibrated. Ready to detect objects.";
+        
+        console.log("Background calibration complete");
+    }
+    
     function loop() {
-        if (videoElement && videoElement.readyState === videoElement.HAVE_ENOUGH_DATA) {
-            predict();
+        if (videoElement && videoElement.readyState === videoElement.HAVE_ENOUGH_DATA && !calibrating) {
+            detectObjectAndPredict();
         }
         animationId = window.requestAnimationFrame(loop);
     }
     
-    async function predict() {
+    async function detectObjectAndPredict() {
+        if (!backgroundFrame) return;
+        
+        let currentFrame = null;
+        let diff = null;
+        
         try {
-            // Capture image from video
-            const imageTensor = tf.browser.fromPixels(videoElement)
-                .resizeNearestNeighbor([224, 224])  // Resize to model input size
+            frameCount++;
+            
+            // Capture current frame
+            currentFrame = tf.browser.fromPixels(videoElement)
+                .resizeNearestNeighbor([224, 224]);
+            
+            // Calculate difference from background
+            diff = tf.abs(tf.sub(currentFrame, backgroundFrame));
+            
+            // Convert to grayscale and threshold
+            const grayscaleDiff = diff.mean(2); // Average RGB channels
+            const threshold = tf.scalar(CHANGE_THRESHOLD);
+            const changedPixels = tf.greater(grayscaleDiff, threshold);
+            
+            // Count changed pixels
+            const totalPixels = 224 * 224;
+            const changedCount = (await changedPixels.sum().data())[0];
+            const changePercentage = (changedCount / totalPixels) * 100;
+            
+            // Clean up intermediate tensors
+            grayscaleDiff.dispose();
+            threshold.dispose();
+            changedPixels.dispose();
+            diff.dispose();
+            
+            // Determine if object is present
+            const wasObjectPresent = objectPresent;
+            objectPresent = changePercentage > CHANGE_PERCENTAGE;
+            
+            // Update UI based on detection
+            if (objectPresent) {
+                stableFrameCount++;
+                overlayDiv.style.display = "none";
+                statusDiv.className = "detecting";
+                
+                // Only predict after object has been stable for required frames
+                if (stableFrameCount >= STABLE_FRAMES_REQUIRED) {
+                    await predict(currentFrame);
+                }
+                
+                if (frameCount % 10 === 0) {
+                    debugDiv.innerHTML = `Debug: Object detected (${changePercentage.toFixed(1)}% changed) - Stable frames: ${stableFrameCount}/${STABLE_FRAMES_REQUIRED}`;
+                }
+            } else {
+                if (wasObjectPresent) {
+                    // Object was removed
+                    console.log("Object removed - clearing display");
+                    clearPredictionDisplay();
+                }
+                stableFrameCount = 0;
+                overlayDiv.style.display = "block";
+                overlayDiv.innerHTML = "📷 Waiting for object...";
+                statusDiv.className = "waiting";
+                
+                if (frameCount % 30 === 0) {
+                    debugDiv.innerHTML = `Debug: No object (${changePercentage.toFixed(1)}% changed) - Waiting...`;
+                }
+            }
+            
+            currentFrame.dispose();
+            
+        } catch (err) {
+            console.error("Detection error:", err);
+            if (currentFrame) currentFrame.dispose();
+            if (diff) diff.dispose();
+        }
+    }
+    
+    async function predict(currentFrame) {
+        let imageTensor = null;
+        let predictions = null;
+        
+        try {
+            // Prepare image for model (normalize to [0,1])
+            imageTensor = currentFrame
                 .toFloat()
-                .div(255.0)  // Normalize to [0, 1]
-                .expandDims(0);  // Add batch dimension
+                .div(255.0)
+                .expandDims(0);
             
             // Make prediction
-            const predictions = await model.predict(imageTensor).data();
+            const predictionTensor = await model.predict(imageTensor);
+            predictions = await predictionTensor.data();
             
-            // Clean up tensor
+            // Clean up tensors
             imageTensor.dispose();
+            predictionTensor.dispose();
             
             // Find best prediction
             let maxProb = 0;
             let maxIndex = 0;
+            let validPredictions = true;
+            
             for (let i = 0; i < predictions.length; i++) {
+                if (isNaN(predictions[i])) {
+                    validPredictions = false;
+                    break;
+                }
                 if (predictions[i] > maxProb) {
                     maxProb = predictions[i];
                     maxIndex = i;
                 }
             }
             
+            if (!validPredictions) {
+                console.error("NaN detected in predictions, restarting...");
+                debugDiv.innerHTML = "Debug: NaN detected! Restarting...";
+                await stopAll();
+                setTimeout(init, 1000);
+                return;
+            }
+            
             const bestClass = CLASS_LABELS[maxIndex];
+            lastPrediction = { class: bestClass, confidence: maxProb };
             
             // Display all predictions
             for (let i = 0; i < CLASS_LABELS.length; i++) {
@@ -157,30 +338,62 @@ window.onload = function() {
                 labelContainer.childNodes[i].innerHTML = 
                     `${CLASS_LABELS[i]}: ${(probability * 100).toFixed(1)}%`;
                 
-                // Highlight the best prediction
                 if (i === maxIndex) {
-                    labelContainer.childNodes[i].style.fontWeight = "bold";
-                    labelContainer.childNodes[i].style.color = "#2196f3";
+                    labelContainer.childNodes[i].className = "highlight";
                 } else {
-                    labelContainer.childNodes[i].style.fontWeight = "normal";
-                    labelContainer.childNodes[i].style.color = "#000";
+                    labelContainer.childNodes[i].className = "";
                 }
             }
             
-            // Send to ESP32 via BLE if connected
-            if (bleCharacteristic && maxProb > 0.5) {  // Only send if confidence > 50%
-                let encoder = new TextEncoder();
-                await bleCharacteristic.writeValue(encoder.encode(bestClass));
+            // Send to ESP32 via BLE if connected and confident
+            const now = Date.now();
+            if (bleCharacteristic && maxProb > CONFIDENCE_THRESHOLD) {
+                if (bestClass !== lastSentCommand || (now - lastSentTime) > 2000) {
+                    await sendBLE(bestClass);
+                    lastSentCommand = bestClass;
+                    lastSentTime = now;
+                }
             }
+            
+            // Update debug info
+            if (frameCount % 10 === 0) {
+                const memInfo = tf.memory();
+                debugDiv.innerHTML = `Debug: Tensors: ${memInfo.numTensors} | Detected: ${bestClass} (${(maxProb * 100).toFixed(1)}%)`;
+            }
+            
         } catch (err) {
             console.error("Prediction error:", err);
+            if (imageTensor) imageTensor.dispose();
+            if (predictions && predictions.dispose) predictions.dispose();
+        }
+    }
+    
+    function clearPredictionDisplay() {
+        if (labelContainer) {
+            for (let i = 0; i < labelContainer.childNodes.length; i++) {
+                labelContainer.childNodes[i].innerHTML = `${CLASS_LABELS[i]}: -`;
+                labelContainer.childNodes[i].className = "";
+            }
+        }
+        lastPrediction = null;
+    }
+    
+    async function sendBLE(command) {
+        try {
+            const message = command;
+            let encoder = new TextEncoder();
+            await bleCharacteristic.writeValue(encoder.encode(message));
+            console.log(`Sent to ESP32: "${message}"`);
+            statusDiv.innerHTML = `Sent "${message}" to ESP32`;
+        } catch (err) {
+            console.error("BLE send error:", err);
         }
     }
     
     async function connectBLE() {
         try {
-            const serviceUUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"; // Nordic UART Service
-            const txUUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // TX (Browser -> ESP32)
+            const serviceUUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+            const txUUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
             
             bleDevice = await navigator.bluetooth.requestDevice({
                 filters: [{ services: [serviceUUID] }]
@@ -202,41 +415,51 @@ window.onload = function() {
     }
     
     async function stopAll() {
-        // Stop the animation loop
         if (animationId) {
             window.cancelAnimationFrame(animationId);
             animationId = null;
         }
         
-        // Stop the webcam
+        // Clean up background frame
+        if (backgroundFrame) {
+            backgroundFrame.dispose();
+            backgroundFrame = null;
+        }
+        
+        tf.disposeVariables();
+        
         if (videoElement && videoElement.srcObject) {
             const stream = videoElement.srcObject;
             const tracks = stream.getTracks();
             tracks.forEach(track => track.stop());
             videoElement.srcObject = null;
             
-            // Remove from DOM
             const container = document.getElementById("webcam-container");
-            container.innerHTML = "";
+            container.innerHTML = '<div id="overlay">📷 Waiting for object...</div>';
+            overlayDiv = document.getElementById("overlay");
             videoElement = null;
         }
         
-        // Disconnect BLE
         if (bleDevice && bleDevice.gatt.connected) {
             await bleDevice.gatt.disconnect();
             bleDevice = null;
             bleCharacteristic = null;
-            statusDiv.innerHTML = "Disconnected from ESP32 BLE";
         }
         
-        // Clear labels
         if (labelContainer) {
             labelContainer.innerHTML = "";
         }
         
+        calibrateBtn.style.display = "none";
         statusDiv.innerHTML = "Stopped";
         statusDiv.style.background = "#f4f4f4";
-        console.log("Camera stopped and BLE disconnected");
+        statusDiv.className = "";
+        debugDiv.innerHTML = "Debug: Stopped";
+        
+        frameCount = 0;
+        lastSentCommand = "";
+        objectPresent = false;
+        stableFrameCount = 0;
     }
 };
 </script>
