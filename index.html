@@ -3,75 +3,50 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Smart Sorter - Production</title>
+<title>Smart Sorter - Stable</title>
 <style>
   body { font-family: sans-serif; text-align: center; margin: 0; padding: 0; background: #f4f4f4; }
-  h2 { background: #2196f3; color: white; padding: 10px; margin: 0; font-size: 1.2em; }
+  h2 { background: #2196f3; color: white; padding: 10px; margin: 0; }
   button { margin: 10px; padding: 10px 20px; font-size: 1em; border: none; border-radius: 5px; background: #4caf50; color: white; cursor: pointer; }
   button:hover { background: #45a049; }
   button.stop { background: #f44336; }
-  button.stop:hover { background: #da190b; }
-  button.calibrate { background: #ff9800; }
-  button.calibrate:hover { background: #f57c00; }
-  #webcam-container { margin-top: 10px; position: relative; }
   video { max-width: 100%; height: auto; border: 2px solid #2196f3; }
-  #overlay { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); 
-             background: rgba(0,0,0,0.7); color: white; padding: 20px; border-radius: 10px;
-             font-size: 1.5em; display: none; }
   #label-container div { font-size: 1.2em; margin: 5px; padding: 8px; background: white; border-radius: 5px; }
-  #status { margin: 10px; padding: 10px; background: #fff; border-radius: 5px; }
   .highlight { font-weight: bold; color: white; background: #2196f3 !important; }
-  #debug { margin: 10px; padding: 10px; background: #fff3cd; border-radius: 5px; font-family: monospace; font-size: 0.9em; }
-  .waiting { background: #ffeaa7 !important; }
-  .detecting { background: #55efc4 !important; }
+  #status, #debug { margin: 10px; padding: 10px; background: #fff; border-radius: 5px; }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest"></script>
 </head>
 <body>
-<h2>Smart Trash Sorter → ESP32</h2>
+<h2>Smart Trash Sorter (Stable Mode)</h2>
 <div id="status">Loading model...</div>
-<button id="startBtn">Start Camera & Model</button>
-<button id="calibrateBtn" class="calibrate" style="display:none;">Calibrate Background</button>
-<button id="bleBtn">Connect to ESP32</button>
-<button id="stopBtn" class="stop">Stop & Disconnect</button>
-<div id="webcam-container">
-  <div id="overlay">📷 Waiting for object...</div>
-</div>
+<button id="startBtn">Start</button>
+<button id="bleBtn">Connect BLE</button>
+<button id="stopBtn" class="stop">Stop</button>
+<div id="webcam-container"></div>
 <div id="label-container"></div>
 <div id="debug">Debug: Waiting...</div>
 <script>
-window.onload = function() {
+window.onload = async function() {
+    // Force CPU backend to avoid WebGL memory issues
+    await tf.setBackend('cpu');
+    console.log('Using backend:', tf.getBackend());
+    
     const MODEL_URL = "./web_model/model.json";
     const CLASS_LABELS = ["cardboard", "glass", "metal", "paper", "plastic", "trash"];
-    
-    // Detection settings
-    const CHANGE_THRESHOLD = 15;
-    const CHANGE_PERCENTAGE = 15;
-    const STABLE_FRAMES_REQUIRED = 5;
-    const CONFIDENCE_THRESHOLD = 0.6;
-    const BACKGROUND_CALIBRATION_FRAMES = 10;
     
     let model, videoElement, labelContainer;
     let bleDevice, bleCharacteristic;
     let animationId = null;
     let statusDiv = document.getElementById("status");
     let debugDiv = document.getElementById("debug");
-    let overlayDiv = document.getElementById("overlay");
-    let calibrateBtn = document.getElementById("calibrateBtn");
     
     let lastSentCommand = "";
     let lastSentTime = 0;
     let frameCount = 0;
-    
-    // Background detection
-    let backgroundFrame = null;
-    let calibrating = false;
-    let calibrationFrames = [];
-    let objectPresent = false;
-    let stableFrameCount = 0;
+    let isSendingBLE = false; // Prevent concurrent BLE sends
     
     document.getElementById("startBtn").onclick = init;
-    document.getElementById("calibrateBtn").onclick = calibrateBackground;
     document.getElementById("bleBtn").onclick = connectBLE;
     document.getElementById("stopBtn").onclick = stopAll;
     
@@ -81,24 +56,21 @@ window.onload = function() {
         try {
             statusDiv.innerHTML = "Loading model...";
             model = await tf.loadLayersModel(MODEL_URL);
-            statusDiv.innerHTML = "Model loaded! Ready to start.";
+            statusDiv.innerHTML = "Model loaded! Click Start.";
             statusDiv.style.background = "#d4edda";
-            console.log("Model loaded successfully");
+            console.log("Model loaded");
         } catch (err) {
-            statusDiv.innerHTML = "Error loading model: " + err.message;
+            statusDiv.innerHTML = "Error: " + err.message;
             statusDiv.style.background = "#f8d7da";
-            console.error("Model loading error:", err);
         }
     }
     
     async function init() {
         try {
             if (!model) {
-                alert("Model not loaded yet. Please wait.");
+                alert("Model not ready");
                 return;
             }
-            
-            statusDiv.innerHTML = "Starting camera...";
             
             videoElement = document.createElement("video");
             videoElement.width = 224;
@@ -115,266 +87,136 @@ window.onload = function() {
             });
             
             videoElement.srcObject = stream;
-            
-            await new Promise((resolve) => {
-                videoElement.onloadedmetadata = () => resolve();
-            });
+            await new Promise(resolve => videoElement.onloadedmetadata = resolve);
             
             document.getElementById("webcam-container").appendChild(videoElement);
             
             labelContainer = document.getElementById("label-container");
             labelContainer.innerHTML = "";
-            for (let i = 0; i < CLASS_LABELS.length; i++) {
+            for (let i = 0; i < 6; i++) {
                 labelContainer.appendChild(document.createElement("div"));
             }
             
-            calibrateBtn.style.display = "inline-block";
-            
-            await calibrateBackground();
-            
-            statusDiv.innerHTML = "Ready! Place object in front of camera.";
-            statusDiv.style.background = "#d4edda";
-            
+            statusDiv.innerHTML = "Running...";
             loop();
         } catch (err) {
-            alert("Error starting camera: " + err.message);
-            console.error(err);
-            statusDiv.innerHTML = "Error: " + err.message;
-            statusDiv.style.background = "#f8d7da";
+            alert("Camera error: " + err.message);
         }
-    }
-    
-    async function calibrateBackground() {
-        if (!videoElement || calibrating) return;
-        
-        calibrating = true;
-        calibrationFrames = [];
-        statusDiv.innerHTML = "Calibrating... Keep camera still!";
-        statusDiv.style.background = "#fff3cd";
-        overlayDiv.style.display = "block";
-        overlayDiv.innerHTML = "📷 Calibrating...<br>Keep still!";
-        
-        for (let i = 0; i < BACKGROUND_CALIBRATION_FRAMES; i++) {
-            await new Promise(resolve => setTimeout(resolve, 100));
-            
-            if (videoElement.readyState === videoElement.HAVE_ENOUGH_DATA) {
-                const frameTensor = tf.browser.fromPixels(videoElement)
-                    .resizeNearestNeighbor([224, 224]);
-                calibrationFrames.push(frameTensor);
-            }
-        }
-        
-        if (calibrationFrames.length > 0) {
-            backgroundFrame = tf.stack(calibrationFrames).mean(0);
-            calibrationFrames.forEach(frame => frame.dispose());
-            calibrationFrames = [];
-        }
-        
-        calibrating = false;
-        statusDiv.innerHTML = "Background calibrated!";
-        statusDiv.style.background = "#d4edda";
-        overlayDiv.innerHTML = "📷 Waiting for object...";
-        
-        console.log("Background calibration complete");
     }
     
     function loop() {
-        if (videoElement && videoElement.readyState === videoElement.HAVE_ENOUGH_DATA && !calibrating) {
-            detectObjectAndPredict();
-        }
-        animationId = window.requestAnimationFrame(loop);
-    }
-    
-    async function detectObjectAndPredict() {
-        if (!backgroundFrame) return;
-        
-        let currentFrame = null;
-        let diff = null;
-        
-        try {
+        if (videoElement && videoElement.readyState === 4) {
+            // Only predict every 3rd frame to reduce load
+            if (frameCount % 3 === 0) {
+                predict();
+            }
             frameCount++;
-            
-            currentFrame = tf.browser.fromPixels(videoElement)
-                .resizeNearestNeighbor([224, 224]);
-            
-            diff = tf.abs(tf.sub(currentFrame, backgroundFrame));
-            const grayscaleDiff = diff.mean(2);
-            const threshold = tf.scalar(CHANGE_THRESHOLD);
-            const changedPixels = tf.greater(grayscaleDiff, threshold);
-            
-            const totalPixels = 224 * 224;
-            const changedCount = (await changedPixels.sum().data())[0];
-            const changePercentage = (changedCount / totalPixels) * 100;
-            
-            // CRITICAL: Dispose intermediate tensors
-            grayscaleDiff.dispose();
-            threshold.dispose();
-            changedPixels.dispose();
-            diff.dispose();
-            
-            const wasObjectPresent = objectPresent;
-            objectPresent = changePercentage > CHANGE_PERCENTAGE;
-            
-            if (objectPresent) {
-                stableFrameCount++;
-                overlayDiv.style.display = "none";
-                statusDiv.className = "detecting";
-                
-                if (stableFrameCount >= STABLE_FRAMES_REQUIRED) {
-                    await predict(currentFrame);
-                }
-            } else {
-                if (wasObjectPresent) {
-                    clearPredictionDisplay();
-                }
-                stableFrameCount = 0;
-                overlayDiv.style.display = "block";
-                statusDiv.className = "waiting";
-            }
-            
-            currentFrame.dispose();
-            
-            // Memory monitoring
-            if (frameCount % 30 === 0) {
-                const memInfo = tf.memory();
-                debugDiv.innerHTML = `Frames: ${frameCount} | Tensors: ${memInfo.numTensors} | Detecting: ${objectPresent}`;
-                
-                // Alert if tensor count is growing (memory leak)
-                if (memInfo.numTensors > 50) {
-                    console.warn("High tensor count:", memInfo.numTensors);
-                }
-            }
-            
-        } catch (err) {
-            console.error("Detection error:", err);
-            if (currentFrame) currentFrame.dispose();
-            if (diff) diff.dispose();
         }
+        animationId = requestAnimationFrame(loop);
     }
     
-    async function predict(currentFrame) {
-        let imageTensor = null;
-        let predictionTensor = null;
-        
-        try {
-            imageTensor = currentFrame
-                .toFloat()
-                .div(255.0)
-                .expandDims(0);
-            
-            predictionTensor = model.predict(imageTensor);
-            const predictions = await predictionTensor.data();
-            
-            // CRITICAL: Dispose tensors immediately
-            imageTensor.dispose();
-            predictionTensor.dispose();
-            
-            let maxProb = 0;
-            let maxIndex = 0;
-            
-            for (let i = 0; i < predictions.length; i++) {
-                if (isNaN(predictions[i])) {
-                    console.error("NaN detected!");
-                    return;
-                }
-                if (predictions[i] > maxProb) {
-                    maxProb = predictions[i];
-                    maxIndex = i;
-                }
+    async function predict() {
+        await tf.tidy(() => {
+            try {
+                // Everything in tidy() is automatically cleaned up
+                const img = tf.browser.fromPixels(videoElement)
+                    .resizeNearestNeighbor([224, 224])
+                    .toFloat()
+                    .div(255.0)
+                    .expandDims(0);
+                
+                const pred = model.predict(img);
+                
+                // Must read data synchronously inside tidy
+                pred.data().then(predictions => {
+                    let maxProb = 0;
+                    let maxIndex = 0;
+                    
+                    for (let i = 0; i < 6; i++) {
+                        if (predictions[i] > maxProb) {
+                            maxProb = predictions[i];
+                            maxIndex = i;
+                        }
+                        
+                        labelContainer.childNodes[i].innerHTML = 
+                            `${CLASS_LABELS[i]}: ${(predictions[i] * 100).toFixed(1)}%`;
+                        labelContainer.childNodes[i].className = 
+                            (i === maxIndex) ? "highlight" : "";
+                    }
+                    
+                    const bestClass = CLASS_LABELS[maxIndex];
+                    
+                    // Send to BLE with throttling
+                    const now = Date.now();
+                    if (bleCharacteristic && maxProb > 0.6 && !isSendingBLE) {
+                        if (bestClass !== lastSentCommand || (now - lastSentTime) > 3000) {
+                            sendBLE(bestClass);
+                            lastSentCommand = bestClass;
+                            lastSentTime = now;
+                        }
+                    }
+                    
+                    // Memory monitoring
+                    if (frameCount % 30 === 0) {
+                        const mem = tf.memory();
+                        debugDiv.innerHTML = `Frames: ${frameCount} | Tensors: ${mem.numTensors} | Memory: ${(mem.numBytes/1024/1024).toFixed(1)}MB`;
+                        
+                        // Auto-restart if memory leaks
+                        if (mem.numTensors > 100) {
+                            console.error("Memory leak detected! Restarting...");
+                            stopAll().then(() => setTimeout(init, 1000));
+                        }
+                    }
+                });
+            } catch (err) {
+                console.error("Prediction error:", err);
             }
-            
-            const bestClass = CLASS_LABELS[maxIndex];
-            
-            // Display predictions
-            for (let i = 0; i < CLASS_LABELS.length; i++) {
-                labelContainer.childNodes[i].innerHTML = 
-                    `${CLASS_LABELS[i]}: ${(predictions[i] * 100).toFixed(1)}%`;
-                labelContainer.childNodes[i].className = (i === maxIndex) ? "highlight" : "";
-            }
-            
-            // Send to ESP32
-            const now = Date.now();
-            if (bleCharacteristic && maxProb > CONFIDENCE_THRESHOLD) {
-                if (bestClass !== lastSentCommand || (now - lastSentTime) > 2000) {
-                    await sendBLE(bestClass);
-                    lastSentCommand = bestClass;
-                    lastSentTime = now;
-                }
-            }
-            
-        } catch (err) {
-            console.error("Prediction error:", err);
-            if (imageTensor) imageTensor.dispose();
-            if (predictionTensor) predictionTensor.dispose();
-        }
-    }
-    
-    function clearPredictionDisplay() {
-        if (labelContainer) {
-            for (let i = 0; i < labelContainer.childNodes.length; i++) {
-                labelContainer.childNodes[i].innerHTML = `${CLASS_LABELS[i]}: -`;
-                labelContainer.childNodes[i].className = "";
-            }
-        }
+        });
     }
     
     async function sendBLE(command) {
+        if (isSendingBLE) return; // Prevent concurrent sends
+        
+        isSendingBLE = true;
         try {
-            let encoder = new TextEncoder();
+            const encoder = new TextEncoder();
             await bleCharacteristic.writeValue(encoder.encode(command));
-            console.log(`Sent to ESP32: "${command}"`);
-            statusDiv.innerHTML = `Sent "${command}" to ESP32`;
+            console.log(`Sent: ${command}`);
+            statusDiv.innerHTML = `Sent: ${command}`;
         } catch (err) {
-            console.error("BLE send error:", err);
+            console.error("BLE error:", err.message);
+        } finally {
+            isSendingBLE = false;
         }
     }
     
     async function connectBLE() {
         try {
-            const serviceUUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
-            const txUUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
-            
             bleDevice = await navigator.bluetooth.requestDevice({
-                filters: [{ services: [serviceUUID] }]
+                filters: [{ services: ["6e400001-b5a3-f393-e0a9-e50e24dcca9e"] }]
             });
             
             const server = await bleDevice.gatt.connect();
-            const service = await server.getPrimaryService(serviceUUID);
-            bleCharacteristic = await service.getCharacteristic(txUUID);
+            const service = await server.getPrimaryService("6e400001-b5a3-f393-e0a9-e50e24dcca9e");
+            bleCharacteristic = await service.getCharacteristic("6e400003-b5a3-f393-e0a9-e50e24dcca9e");
             
-            statusDiv.innerHTML = "Connected to ESP32 BLE!";
-            statusDiv.style.background = "#d4edda";
-            alert("Connected to ESP32!");
-        } catch (error) {
-            console.error(error);
-            alert("BLE connection failed: " + error.message);
+            statusDiv.innerHTML = "BLE Connected!";
+            alert("Connected!");
+        } catch (err) {
+            alert("BLE failed: " + err.message);
         }
     }
     
     async function stopAll() {
         if (animationId) {
-            window.cancelAnimationFrame(animationId);
+            cancelAnimationFrame(animationId);
             animationId = null;
         }
         
-        // Clean up background frame
-        if (backgroundFrame) {
-            backgroundFrame.dispose();
-            backgroundFrame = null;
-        }
-        
-        // Dispose all tensors
-        tf.disposeVariables();
-        
         if (videoElement && videoElement.srcObject) {
-            const stream = videoElement.srcObject;
-            const tracks = stream.getTracks();
-            tracks.forEach(track => track.stop());
+            videoElement.srcObject.getTracks().forEach(t => t.stop());
             videoElement.srcObject = null;
-            
-            const container = document.getElementById("webcam-container");
-            container.innerHTML = '<div id="overlay">📷 Waiting for object...</div>';
-            overlayDiv = document.getElementById("overlay");
+            document.getElementById("webcam-container").innerHTML = "";
             videoElement = null;
         }
         
@@ -384,20 +226,19 @@ window.onload = function() {
             bleCharacteristic = null;
         }
         
-        if (labelContainer) {
-            labelContainer.innerHTML = "";
-        }
+        if (labelContainer) labelContainer.innerHTML = "";
         
-        calibrateBtn.style.display = "none";
+        // Force garbage collection
+        if (window.gc) window.gc();
+        
         statusDiv.innerHTML = "Stopped";
-        statusDiv.style.background = "#f4f4f4";
-        debugDiv.innerHTML = "Debug: Stopped";
+        debugDiv.innerHTML = "Debug: Stopped | Memory: " + JSON.stringify(tf.memory());
         
         frameCount = 0;
         lastSentCommand = "";
-        objectPresent = false;
+        isSendingBLE = false;
         
-        console.log("Stopped - Memory info:", tf.memory());
+        console.log("Stopped. Final memory:", tf.memory());
     }
 };
 </script>
