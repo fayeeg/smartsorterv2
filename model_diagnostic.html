@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Model Diagnostic Tool</title>
+<style>
+  body { font-family: monospace; padding: 20px; background: #f4f4f4; }
+  h2 { color: #2196f3; }
+  button { margin: 10px; padding: 10px 20px; font-size: 1em; border: none; border-radius: 5px; 
+           background: #4caf50; color: white; cursor: pointer; }
+  button:hover { background: #45a049; }
+  #info { background: white; padding: 15px; border-radius: 5px; margin: 10px 0; }
+  .section { background: #fff; padding: 15px; margin: 10px 0; border-radius: 5px; border-left: 4px solid #2196f3; }
+  .error { border-left-color: #f44336; background: #ffebee; }
+  .success { border-left-color: #4caf50; background: #e8f5e9; }
+  .warning { border-left-color: #ff9800; background: #fff3e0; }
+  pre { background: #263238; color: #aed581; padding: 10px; border-radius: 5px; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; margin: 10px 0; }
+  th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+  th { background: #2196f3; color: white; }
+  video { max-width: 300px; border: 2px solid #2196f3; }
+  canvas { max-width: 300px; border: 2px solid #ff9800; margin-left: 10px; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest"></script>
+</head>
+<body>
+<h2>🔍 Smart Sorter Model Diagnostic Tool</h2>
+
+<div class="section">
+  <h3>Step 1: Load Model</h3>
+  <input type="text" id="modelPath" value="./web_model/model.json" style="width: 400px; padding: 5px;">
+  <button onclick="loadModelTest()">Load & Inspect Model</button>
+  <div id="modelInfo"></div>
+</div>
+
+<div class="section">
+  <h3>Step 2: Start Camera</h3>
+  <button onclick="startCamera()">Start Camera</button>
+  <div id="cameraInfo"></div>
+  <div style="margin-top: 10px;">
+    <video id="video" autoplay playsinline></video>
+    <canvas id="canvas" width="224" height="224"></canvas>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Step 3: Test Predictions</h3>
+  <button onclick="testPrediction()">Run Single Prediction</button>
+  <button onclick="startContinuous()">Start Continuous Testing</button>
+  <button onclick="stopContinuous()">Stop</button>
+  <div id="predictionInfo"></div>
+</div>
+
+<div class="section">
+  <h3>Step 4: Raw Model Output</h3>
+  <div id="rawOutput"></div>
+</div>
+
+<script>
+let model = null;
+let video = null;
+let canvas = null;
+let ctx = null;
+let continuousInterval = null;
+
+const CLASS_LABELS = ["cardboard", "glass", "metal", "paper", "plastic", "trash"];
+
+async function loadModelTest() {
+  const modelPath = document.getElementById('modelPath').value;
+  const infoDiv = document.getElementById('modelInfo');
+  
+  try {
+    infoDiv.innerHTML = '<p>Loading model...</p>';
+    
+    model = await tf.loadLayersModel(modelPath);
+    
+    let info = '<div class="success">';
+    info += '<h4>✅ Model Loaded Successfully</h4>';
+    info += '<table>';
+    info += '<tr><th>Property</th><th>Value</th></tr>';
+    info += `<tr><td>Input Shape</td><td>${JSON.stringify(model.inputs[0].shape)}</td></tr>`;
+    info += `<tr><td>Output Shape</td><td>${JSON.stringify(model.outputs[0].shape)}</td></tr>`;
+    info += `<tr><td>Total Layers</td><td>${model.layers.length}</td></tr>`;
+    info += `<tr><td>Trainable Params</td><td>${model.countParams()}</td></tr>`;
+    info += '</table>';
+    
+    // Model summary
+    info += '<h4>Model Architecture:</h4><pre>';
+    model.layers.forEach((layer, i) => {
+      info += `Layer ${i}: ${layer.name} (${layer.getClassName()}) - Output: ${JSON.stringify(layer.outputShape)}\n`;
+    });
+    info += '</pre>';
+    info += '</div>';
+    
+    infoDiv.innerHTML = info;
+    
+  } catch (err) {
+    infoDiv.innerHTML = `<div class="error"><h4>❌ Error Loading Model</h4><p>${err.message}</p><pre>${err.stack}</pre></div>`;
+  }
+}
+
+async function startCamera() {
+  const infoDiv = document.getElementById('cameraInfo');
+  video = document.getElementById('video');
+  canvas = document.getElementById('canvas');
+  ctx = canvas.getContext('2d');
+  
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { 
+        facingMode: "environment",
+        width: { ideal: 640 },
+        height: { ideal: 480 }
+      }
+    });
+    
+    video.srcObject = stream;
+    await video.play();
+    
+    infoDiv.innerHTML = '<div class="success"><h4>✅ Camera Started</h4></div>';
+    
+  } catch (err) {
+    infoDiv.innerHTML = `<div class="error"><h4>❌ Camera Error</h4><p>${err.message}</p></div>`;
+  }
+}
+
+async function testPrediction() {
+  if (!model) {
+    alert('Load model first!');
+    return;
+  }
+  if (!video || video.paused) {
+    alert('Start camera first!');
+    return;
+  }
+  
+  const infoDiv = document.getElementById('predictionInfo');
+  const rawDiv = document.getElementById('rawOutput');
+  
+  try {
+    // Draw current frame to canvas
+    ctx.drawImage(video, 0, 0, 224, 224);
+    
+    // Get image data and show pixel values
+    const imageData = ctx.getImageData(0, 0, 224, 224);
+    const samplePixels = [];
+    for (let i = 0; i < 10; i++) {
+      const idx = Math.floor(Math.random() * (224 * 224)) * 4;
+      samplePixels.push(`RGB(${imageData.data[idx]}, ${imageData.data[idx+1]}, ${imageData.data[idx+2]})`);
+    }
+    
+    // Prepare tensor
+    const imageTensor = tf.browser.fromPixels(canvas)
+      .resizeNearestNeighbor([224, 224])
+      .toFloat()
+      .div(255.0)
+      .expandDims(0);
+    
+    // Get tensor stats
+    const tensorStats = {
+      min: (await imageTensor.min().data())[0],
+      max: (await imageTensor.max().data())[0],
+      mean: (await imageTensor.mean().data())[0]
+    };
+    
+    console.log('Input tensor stats:', tensorStats);
+    
+    // Make prediction
+    const predictionTensor = model.predict(imageTensor);
+    const predictions = await predictionTensor.data();
+    
+    // Get raw output stats
+    let rawOutputInfo = '<div class="warning">';
+    rawOutputInfo += '<h4>📊 Raw Model Output Analysis</h4>';
+    rawOutputInfo += '<table>';
+    rawOutputInfo += '<tr><th>Index</th><th>Class</th><th>Raw Value</th><th>After Softmax</th><th>Percentage</th></tr>';
+    
+    // Calculate softmax manually
+    const maxVal = Math.max(...predictions);
+    const expVals = Array.from(predictions).map(x => Math.exp(x - maxVal));
+    const sumExp = expVals.reduce((a, b) => a + b, 0);
+    const softmax = expVals.map(x => x / sumExp);
+    
+    for (let i = 0; i < predictions.length; i++) {
+      rawOutputInfo += `<tr>`;
+      rawOutputInfo += `<td>${i}</td>`;
+      rawOutputInfo += `<td><strong>${CLASS_LABELS[i]}</strong></td>`;
+      rawOutputInfo += `<td>${predictions[i].toFixed(6)}</td>`;
+      rawOutputInfo += `<td>${softmax[i].toFixed(6)}</td>`;
+      rawOutputInfo += `<td>${(softmax[i] * 100).toFixed(2)}%</td>`;
+      rawOutputInfo += `</tr>`;
+    }
+    rawOutputInfo += '</table>';
+    
+    // Check for issues
+    rawOutputInfo += '<h4>🔍 Diagnosis:</h4><ul>';
+    
+    // Check if all outputs are similar (untrained model)
+    const outputVariance = softmax.reduce((sum, val) => sum + Math.pow(val - 1/6, 2), 0) / 6;
+    if (outputVariance < 0.01) {
+      rawOutputInfo += '<li class="error">⚠️ All outputs are nearly equal (~16.7%) - Model may not be trained!</li>';
+    }
+    
+    // Check if one output dominates
+    const maxProb = Math.max(...softmax);
+    if (maxProb > 0.95) {
+      rawOutputInfo += '<li class="error">⚠️ One class dominates (>95%) - Model may be overfitted or broken!</li>';
+    }
+    
+    // Check raw values
+    const allPositive = Array.from(predictions).every(x => x > 0);
+    const allNegative = Array.from(predictions).every(x => x < 0);
+    if (allPositive) {
+      rawOutputInfo += '<li>✅ Raw outputs are positive (likely has softmax layer)</li>';
+    } else if (allNegative) {
+      rawOutputInfo += '<li>⚠️ Raw outputs are negative (may need softmax activation)</li>';
+    }
+    
+    // Check for NaN
+    if (Array.from(predictions).some(x => isNaN(x))) {
+      rawOutputInfo += '<li class="error">❌ NaN detected in outputs! Model is broken!</li>';
+    }
+    
+    rawOutputInfo += '</ul>';
+    rawOutputInfo += `<p><strong>Sample input pixels:</strong> ${samplePixels.join(', ')}</p>`;
+    rawOutputInfo += `<p><strong>Input tensor stats:</strong> min=${tensorStats.min.toFixed(3)}, max=${tensorStats.max.toFixed(3)}, mean=${tensorStats.mean.toFixed(3)}</p>`;
+    rawOutputInfo += '</div>';
+    
+    rawDiv.innerHTML = rawOutputInfo;
+    
+    // Display prediction
+    const bestIdx = softmax.indexOf(Math.max(...softmax));
+    let predInfo = '<div class="success">';
+    predInfo += '<h4>🎯 Prediction Result</h4>';
+    predInfo += `<p style="font-size: 1.5em;"><strong>${CLASS_LABELS[bestIdx]}</strong> (${(softmax[bestIdx] * 100).toFixed(1)}%)</p>`;
+    predInfo += '<p>All probabilities:</p><ul>';
+    CLASS_LABELS.forEach((label, i) => {
+      predInfo += `<li>${label}: ${(softmax[i] * 100).toFixed(1)}%</li>`;
+    });
+    predInfo += '</ul></div>';
+    
+    infoDiv.innerHTML = predInfo;
+    
+    // Cleanup
+    imageTensor.dispose();
+    predictionTensor.dispose();
+    
+  } catch (err) {
+    infoDiv.innerHTML = `<div class="error"><h4>❌ Prediction Error</h4><p>${err.message}</p><pre>${err.stack}</pre></div>`;
+  }
+}
+
+function startContinuous() {
+  if (continuousInterval) return;
+  continuousInterval = setInterval(testPrediction, 1000);
+}
+
+function stopContinuous() {
+  if (continuousInterval) {
+    clearInterval(continuousInterval);
+    continuousInterval = null;
+  }
+}
+
+// Auto-load model on page load
+window.onload = function() {
+  console.log('Diagnostic tool loaded. Click "Load & Inspect Model" to begin.');
+};
+</script>
+</body>
+</html>
