@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Smart Sorter</title>
+<style>
+  body { font-family: sans-serif; text-align: center; margin: 0; padding: 0; background: #f4f4f4; }
+  h2 { background: #2196f3; color: white; padding: 10px; margin: 0; font-size: 1.2em; }
+  button { margin: 10px; padding: 10px 20px; font-size: 1em; border: none; border-radius: 5px; background: #4caf50; color: white; cursor: pointer; }
+  button:hover { background: #45a049; }
+  button.stop { background: #f44336; }
+  button.stop:hover { background: #da190b; }
+  #webcam-container { margin-top: 10px; }
+  video, canvas { max-width: 100%; height: auto; }
+  #label-container div { font-size: 1.2em; margin-top: 5px; }
+  #status { margin: 10px; padding: 10px; background: #fff; border-radius: 5px; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest"></script>
+</head>
+<body>
+<h2>Smart Trash Sorter → ESP32</h2>
+<div id="status">Loading model...</div>
+<button id="startBtn">Start Camera & Model</button>
+<button id="bleBtn">Connect to ESP32</button>
+<button id="stopBtn" class="stop">Stop & Disconnect</button>
+<div id="webcam-container"></div>
+<div id="label-container"></div>
+<script>
+window.onload = function() {
+    // UPDATE THIS PATH to where you host your web_model folder
+    const MODEL_URL = "./web_model/model.json"; 
+    
+    // Define your class labels (must match the order your model was trained with)
+    const CLASS_LABELS = ["cardboard", "glass", "metal", "paper", "plastic", "trash"];
+    
+    let model, webcam, labelContainer;
+    let bleDevice, bleCharacteristic;
+    let animationId = null;
+    let videoElement;
+    let statusDiv = document.getElementById("status");
+    
+    document.getElementById("startBtn").onclick = init;
+    document.getElementById("bleBtn").onclick = connectBLE;
+    document.getElementById("stopBtn").onclick = stopAll;
+    
+    // Load model on page load
+    loadModel();
+    
+    async function loadModel() {
+        try {
+            statusDiv.innerHTML = "Loading model...";
+            model = await tf.loadLayersModel(MODEL_URL);
+            statusDiv.innerHTML = "Model loaded! Ready to start.";
+            statusDiv.style.background = "#d4edda";
+            console.log("Model loaded successfully");
+        } catch (err) {
+            statusDiv.innerHTML = "Error loading model: " + err.message;
+            statusDiv.style.background = "#f8d7da";
+            console.error("Model loading error:", err);
+        }
+    }
+    
+    async function init() {
+        try {
+            if (!model) {
+                alert("Model not loaded yet. Please wait.");
+                return;
+            }
+            
+            statusDiv.innerHTML = "Starting camera...";
+            
+            // Create video element for webcam
+            videoElement = document.createElement("video");
+            videoElement.width = 224;
+            videoElement.height = 224;
+            videoElement.autoplay = true;
+            videoElement.playsInline = true;
+            
+            // Request camera access (back camera on mobile)
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: { 
+                    facingMode: "environment",
+                    width: 224,
+                    height: 224
+                }
+            });
+            
+            videoElement.srcObject = stream;
+            
+            // Wait for video to be ready
+            await new Promise((resolve) => {
+                videoElement.onloadedmetadata = () => {
+                    resolve();
+                };
+            });
+            
+            document.getElementById("webcam-container").appendChild(videoElement);
+            
+            // Setup label container
+            labelContainer = document.getElementById("label-container");
+            labelContainer.innerHTML = "";
+            for (let i = 0; i < CLASS_LABELS.length; i++) {
+                labelContainer.appendChild(document.createElement("div"));
+            }
+            
+            statusDiv.innerHTML = "Camera started! Predicting...";
+            statusDiv.style.background = "#d4edda";
+            
+            // Start prediction loop
+            loop();
+        } catch (err) {
+            alert("Error starting camera: " + err.message);
+            console.error(err);
+            statusDiv.innerHTML = "Error: " + err.message;
+            statusDiv.style.background = "#f8d7da";
+        }
+    }
+    
+    function loop() {
+        if (videoElement && videoElement.readyState === videoElement.HAVE_ENOUGH_DATA) {
+            predict();
+        }
+        animationId = window.requestAnimationFrame(loop);
+    }
+    
+    async function predict() {
+        try {
+            // Capture image from video
+            const imageTensor = tf.browser.fromPixels(videoElement)
+                .resizeNearestNeighbor([224, 224])  // Resize to model input size
+                .toFloat()
+                .div(255.0)  // Normalize to [0, 1]
+                .expandDims(0);  // Add batch dimension
+            
+            // Make prediction
+            const predictions = await model.predict(imageTensor).data();
+            
+            // Clean up tensor
+            imageTensor.dispose();
+            
+            // Find best prediction
+            let maxProb = 0;
+            let maxIndex = 0;
+            for (let i = 0; i < predictions.length; i++) {
+                if (predictions[i] > maxProb) {
+                    maxProb = predictions[i];
+                    maxIndex = i;
+                }
+            }
+            
+            const bestClass = CLASS_LABELS[maxIndex];
+            
+            // Display all predictions
+            for (let i = 0; i < CLASS_LABELS.length; i++) {
+                const probability = predictions[i];
+                labelContainer.childNodes[i].innerHTML = 
+                    `${CLASS_LABELS[i]}: ${(probability * 100).toFixed(1)}%`;
+                
+                // Highlight the best prediction
+                if (i === maxIndex) {
+                    labelContainer.childNodes[i].style.fontWeight = "bold";
+                    labelContainer.childNodes[i].style.color = "#2196f3";
+                } else {
+                    labelContainer.childNodes[i].style.fontWeight = "normal";
+                    labelContainer.childNodes[i].style.color = "#000";
+                }
+            }
+            
+            // Send to ESP32 via BLE if connected
+            if (bleCharacteristic && maxProb > 0.5) {  // Only send if confidence > 50%
+                let encoder = new TextEncoder();
+                await bleCharacteristic.writeValue(encoder.encode(bestClass));
+            }
+        } catch (err) {
+            console.error("Prediction error:", err);
+        }
+    }
+    
+    async function connectBLE() {
+        try {
+            const serviceUUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"; // Nordic UART Service
+            const txUUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // TX (Browser -> ESP32)
+            
+            bleDevice = await navigator.bluetooth.requestDevice({
+                filters: [{ services: [serviceUUID] }]
+            });
+            
+            const server = await bleDevice.gatt.connect();
+            const service = await server.getPrimaryService(serviceUUID);
+            bleCharacteristic = await service.getCharacteristic(txUUID);
+            
+            statusDiv.innerHTML = "Connected to ESP32 BLE!";
+            statusDiv.style.background = "#d4edda";
+            alert("Connected to ESP32 BLE!");
+        } catch (error) {
+            console.error(error);
+            alert("BLE connection failed: " + error.message);
+            statusDiv.innerHTML = "BLE connection failed";
+            statusDiv.style.background = "#f8d7da";
+        }
+    }
+    
+    async function stopAll() {
+        // Stop the animation loop
+        if (animationId) {
+            window.cancelAnimationFrame(animationId);
+            animationId = null;
+        }
+        
+        // Stop the webcam
+        if (videoElement && videoElement.srcObject) {
+            const stream = videoElement.srcObject;
+            const tracks = stream.getTracks();
+            tracks.forEach(track => track.stop());
+            videoElement.srcObject = null;
+            
+            // Remove from DOM
+            const container = document.getElementById("webcam-container");
+            container.innerHTML = "";
+            videoElement = null;
+        }
+        
+        // Disconnect BLE
+        if (bleDevice && bleDevice.gatt.connected) {
+            await bleDevice.gatt.disconnect();
+            bleDevice = null;
+            bleCharacteristic = null;
+            statusDiv.innerHTML = "Disconnected from ESP32 BLE";
+        }
+        
+        // Clear labels
+        if (labelContainer) {
+            labelContainer.innerHTML = "";
+        }
+        
+        statusDiv.innerHTML = "Stopped";
+        statusDiv.style.background = "#f4f4f4";
+        console.log("Camera stopped and BLE disconnected");
+    }
+};
+</script>
+</body>
+</html>
