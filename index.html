@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Smart Sorter</title>
+<title>Smart Sorter - Production</title>
 <style>
   body { font-family: sans-serif; text-align: center; margin: 0; padding: 0; background: #f4f4f4; }
   h2 { background: #2196f3; color: white; padding: 10px; margin: 0; font-size: 1.2em; }
@@ -14,13 +14,13 @@
   button.calibrate { background: #ff9800; }
   button.calibrate:hover { background: #f57c00; }
   #webcam-container { margin-top: 10px; position: relative; }
-  video, canvas { max-width: 100%; height: auto; }
+  video { max-width: 100%; height: auto; border: 2px solid #2196f3; }
   #overlay { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); 
              background: rgba(0,0,0,0.7); color: white; padding: 20px; border-radius: 10px;
              font-size: 1.5em; display: none; }
-  #label-container div { font-size: 1.2em; margin-top: 5px; padding: 5px; }
+  #label-container div { font-size: 1.2em; margin: 5px; padding: 8px; background: white; border-radius: 5px; }
   #status { margin: 10px; padding: 10px; background: #fff; border-radius: 5px; }
-  .highlight { font-weight: bold; color: #2196f3; background: #e3f2fd; }
+  .highlight { font-weight: bold; color: white; background: #2196f3 !important; }
   #debug { margin: 10px; padding: 10px; background: #fff3cd; border-radius: 5px; font-family: monospace; font-size: 0.9em; }
   .waiting { background: #ffeaa7 !important; }
   .detecting { background: #55efc4 !important; }
@@ -41,24 +41,19 @@
 <div id="debug">Debug: Waiting...</div>
 <script>
 window.onload = function() {
-    // UPDATE THIS PATH to where you host your web_model folder
-    const MODEL_URL = "./web_model/model.json"; 
-    
-    // Define your class labels (must match the order your model was trained with)
+    const MODEL_URL = "./web_model/model.json";
     const CLASS_LABELS = ["cardboard", "glass", "metal", "paper", "plastic", "trash"];
     
-    // ===== DETECTION SETTINGS (ADJUST THESE) =====
-    const CHANGE_THRESHOLD = 15;        // Minimum pixel difference to detect object (0-255)
-    const CHANGE_PERCENTAGE = 15;       // Minimum % of pixels that must change (0-100)
-    const STABLE_FRAMES_REQUIRED = 5;   // Frames object must be stable before prediction
-    const CONFIDENCE_THRESHOLD = 0.6;   // Minimum confidence to send to ESP32 (0-1)
-    const BACKGROUND_CALIBRATION_FRAMES = 10; // Frames to average for background
-    // =============================================
+    // Detection settings
+    const CHANGE_THRESHOLD = 15;
+    const CHANGE_PERCENTAGE = 15;
+    const STABLE_FRAMES_REQUIRED = 5;
+    const CONFIDENCE_THRESHOLD = 0.6;
+    const BACKGROUND_CALIBRATION_FRAMES = 10;
     
-    let model, webcam, labelContainer;
+    let model, videoElement, labelContainer;
     let bleDevice, bleCharacteristic;
     let animationId = null;
-    let videoElement;
     let statusDiv = document.getElementById("status");
     let debugDiv = document.getElementById("debug");
     let overlayDiv = document.getElementById("overlay");
@@ -68,20 +63,18 @@ window.onload = function() {
     let lastSentTime = 0;
     let frameCount = 0;
     
-    // Background detection variables
+    // Background detection
     let backgroundFrame = null;
     let calibrating = false;
     let calibrationFrames = [];
     let objectPresent = false;
     let stableFrameCount = 0;
-    let lastPrediction = null;
     
     document.getElementById("startBtn").onclick = init;
     document.getElementById("calibrateBtn").onclick = calibrateBackground;
     document.getElementById("bleBtn").onclick = connectBLE;
     document.getElementById("stopBtn").onclick = stopAll;
     
-    // Load model on page load
     loadModel();
     
     async function loadModel() {
@@ -107,14 +100,12 @@ window.onload = function() {
             
             statusDiv.innerHTML = "Starting camera...";
             
-            // Create video element for webcam
             videoElement = document.createElement("video");
             videoElement.width = 224;
             videoElement.height = 224;
             videoElement.autoplay = true;
             videoElement.playsInline = true;
             
-            // Request camera access (back camera on mobile)
             const stream = await navigator.mediaDevices.getUserMedia({
                 video: { 
                     facingMode: "environment",
@@ -125,35 +116,25 @@ window.onload = function() {
             
             videoElement.srcObject = stream;
             
-            // Wait for video to be ready
             await new Promise((resolve) => {
-                videoElement.onloadedmetadata = () => {
-                    resolve();
-                };
+                videoElement.onloadedmetadata = () => resolve();
             });
             
             document.getElementById("webcam-container").appendChild(videoElement);
             
-            // Setup label container
             labelContainer = document.getElementById("label-container");
             labelContainer.innerHTML = "";
             for (let i = 0; i < CLASS_LABELS.length; i++) {
                 labelContainer.appendChild(document.createElement("div"));
             }
             
-            statusDiv.innerHTML = "Calibrating background... Keep camera still!";
-            statusDiv.style.background = "#fff3cd";
-            
-            // Show calibrate button
             calibrateBtn.style.display = "inline-block";
             
-            // Auto-calibrate background on start
             await calibrateBackground();
             
             statusDiv.innerHTML = "Ready! Place object in front of camera.";
             statusDiv.style.background = "#d4edda";
             
-            // Start detection loop
             loop();
         } catch (err) {
             alert("Error starting camera: " + err.message);
@@ -170,13 +151,9 @@ window.onload = function() {
         calibrationFrames = [];
         statusDiv.innerHTML = "Calibrating... Keep camera still!";
         statusDiv.style.background = "#fff3cd";
-        statusDiv.className = "waiting";
         overlayDiv.style.display = "block";
-        overlayDiv.innerHTML = "📷 Calibrating...<br>Keep camera still!";
+        overlayDiv.innerHTML = "📷 Calibrating...<br>Keep still!";
         
-        debugDiv.innerHTML = "Debug: Calibrating background...";
-        
-        // Capture multiple frames and average them
         for (let i = 0; i < BACKGROUND_CALIBRATION_FRAMES; i++) {
             await new Promise(resolve => setTimeout(resolve, 100));
             
@@ -187,19 +164,16 @@ window.onload = function() {
             }
         }
         
-        // Average all frames
         if (calibrationFrames.length > 0) {
             backgroundFrame = tf.stack(calibrationFrames).mean(0);
-            // Clean up individual frames
             calibrationFrames.forEach(frame => frame.dispose());
             calibrationFrames = [];
         }
         
         calibrating = false;
-        statusDiv.innerHTML = "Background calibrated! Place object to scan.";
+        statusDiv.innerHTML = "Background calibrated!";
         statusDiv.style.background = "#d4edda";
         overlayDiv.innerHTML = "📷 Waiting for object...";
-        debugDiv.innerHTML = "Debug: Background calibrated. Ready to detect objects.";
         
         console.log("Background calibration complete");
     }
@@ -220,64 +194,56 @@ window.onload = function() {
         try {
             frameCount++;
             
-            // Capture current frame
             currentFrame = tf.browser.fromPixels(videoElement)
                 .resizeNearestNeighbor([224, 224]);
             
-            // Calculate difference from background
             diff = tf.abs(tf.sub(currentFrame, backgroundFrame));
-            
-            // Convert to grayscale and threshold
-            const grayscaleDiff = diff.mean(2); // Average RGB channels
+            const grayscaleDiff = diff.mean(2);
             const threshold = tf.scalar(CHANGE_THRESHOLD);
             const changedPixels = tf.greater(grayscaleDiff, threshold);
             
-            // Count changed pixels
             const totalPixels = 224 * 224;
             const changedCount = (await changedPixels.sum().data())[0];
             const changePercentage = (changedCount / totalPixels) * 100;
             
-            // Clean up intermediate tensors
+            // CRITICAL: Dispose intermediate tensors
             grayscaleDiff.dispose();
             threshold.dispose();
             changedPixels.dispose();
             diff.dispose();
             
-            // Determine if object is present
             const wasObjectPresent = objectPresent;
             objectPresent = changePercentage > CHANGE_PERCENTAGE;
             
-            // Update UI based on detection
             if (objectPresent) {
                 stableFrameCount++;
                 overlayDiv.style.display = "none";
                 statusDiv.className = "detecting";
                 
-                // Only predict after object has been stable for required frames
                 if (stableFrameCount >= STABLE_FRAMES_REQUIRED) {
                     await predict(currentFrame);
                 }
-                
-                if (frameCount % 10 === 0) {
-                    debugDiv.innerHTML = `Debug: Object detected (${changePercentage.toFixed(1)}% changed) - Stable frames: ${stableFrameCount}/${STABLE_FRAMES_REQUIRED}`;
-                }
             } else {
                 if (wasObjectPresent) {
-                    // Object was removed
-                    console.log("Object removed - clearing display");
                     clearPredictionDisplay();
                 }
                 stableFrameCount = 0;
                 overlayDiv.style.display = "block";
-                overlayDiv.innerHTML = "📷 Waiting for object...";
                 statusDiv.className = "waiting";
-                
-                if (frameCount % 30 === 0) {
-                    debugDiv.innerHTML = `Debug: No object (${changePercentage.toFixed(1)}% changed) - Waiting...`;
-                }
             }
             
             currentFrame.dispose();
+            
+            // Memory monitoring
+            if (frameCount % 30 === 0) {
+                const memInfo = tf.memory();
+                debugDiv.innerHTML = `Frames: ${frameCount} | Tensors: ${memInfo.numTensors} | Detecting: ${objectPresent}`;
+                
+                // Alert if tensor count is growing (memory leak)
+                if (memInfo.numTensors > 50) {
+                    console.warn("High tensor count:", memInfo.numTensors);
+                }
+            }
             
         } catch (err) {
             console.error("Detection error:", err);
@@ -288,32 +254,28 @@ window.onload = function() {
     
     async function predict(currentFrame) {
         let imageTensor = null;
-        let predictions = null;
+        let predictionTensor = null;
         
         try {
-            // Prepare image for model (normalize to [0,1])
             imageTensor = currentFrame
                 .toFloat()
                 .div(255.0)
                 .expandDims(0);
             
-            // Make prediction
-            const predictionTensor = await model.predict(imageTensor);
-            predictions = await predictionTensor.data();
+            predictionTensor = model.predict(imageTensor);
+            const predictions = await predictionTensor.data();
             
-            // Clean up tensors
+            // CRITICAL: Dispose tensors immediately
             imageTensor.dispose();
             predictionTensor.dispose();
             
-            // Find best prediction
             let maxProb = 0;
             let maxIndex = 0;
-            let validPredictions = true;
             
             for (let i = 0; i < predictions.length; i++) {
                 if (isNaN(predictions[i])) {
-                    validPredictions = false;
-                    break;
+                    console.error("NaN detected!");
+                    return;
                 }
                 if (predictions[i] > maxProb) {
                     maxProb = predictions[i];
@@ -321,31 +283,16 @@ window.onload = function() {
                 }
             }
             
-            if (!validPredictions) {
-                console.error("NaN detected in predictions, restarting...");
-                debugDiv.innerHTML = "Debug: NaN detected! Restarting...";
-                await stopAll();
-                setTimeout(init, 1000);
-                return;
-            }
-            
             const bestClass = CLASS_LABELS[maxIndex];
-            lastPrediction = { class: bestClass, confidence: maxProb };
             
-            // Display all predictions
+            // Display predictions
             for (let i = 0; i < CLASS_LABELS.length; i++) {
-                const probability = predictions[i];
                 labelContainer.childNodes[i].innerHTML = 
-                    `${CLASS_LABELS[i]}: ${(probability * 100).toFixed(1)}%`;
-                
-                if (i === maxIndex) {
-                    labelContainer.childNodes[i].className = "highlight";
-                } else {
-                    labelContainer.childNodes[i].className = "";
-                }
+                    `${CLASS_LABELS[i]}: ${(predictions[i] * 100).toFixed(1)}%`;
+                labelContainer.childNodes[i].className = (i === maxIndex) ? "highlight" : "";
             }
             
-            // Send to ESP32 via BLE if connected and confident
+            // Send to ESP32
             const now = Date.now();
             if (bleCharacteristic && maxProb > CONFIDENCE_THRESHOLD) {
                 if (bestClass !== lastSentCommand || (now - lastSentTime) > 2000) {
@@ -355,16 +302,10 @@ window.onload = function() {
                 }
             }
             
-            // Update debug info
-            if (frameCount % 10 === 0) {
-                const memInfo = tf.memory();
-                debugDiv.innerHTML = `Debug: Tensors: ${memInfo.numTensors} | Detected: ${bestClass} (${(maxProb * 100).toFixed(1)}%)`;
-            }
-            
         } catch (err) {
             console.error("Prediction error:", err);
             if (imageTensor) imageTensor.dispose();
-            if (predictions && predictions.dispose) predictions.dispose();
+            if (predictionTensor) predictionTensor.dispose();
         }
     }
     
@@ -375,16 +316,14 @@ window.onload = function() {
                 labelContainer.childNodes[i].className = "";
             }
         }
-        lastPrediction = null;
     }
     
     async function sendBLE(command) {
         try {
-            const message = command;
             let encoder = new TextEncoder();
-            await bleCharacteristic.writeValue(encoder.encode(message));
-            console.log(`Sent to ESP32: "${message}"`);
-            statusDiv.innerHTML = `Sent "${message}" to ESP32`;
+            await bleCharacteristic.writeValue(encoder.encode(command));
+            console.log(`Sent to ESP32: "${command}"`);
+            statusDiv.innerHTML = `Sent "${command}" to ESP32`;
         } catch (err) {
             console.error("BLE send error:", err);
         }
@@ -405,12 +344,10 @@ window.onload = function() {
             
             statusDiv.innerHTML = "Connected to ESP32 BLE!";
             statusDiv.style.background = "#d4edda";
-            alert("Connected to ESP32 BLE!");
+            alert("Connected to ESP32!");
         } catch (error) {
             console.error(error);
             alert("BLE connection failed: " + error.message);
-            statusDiv.innerHTML = "BLE connection failed";
-            statusDiv.style.background = "#f8d7da";
         }
     }
     
@@ -426,6 +363,7 @@ window.onload = function() {
             backgroundFrame = null;
         }
         
+        // Dispose all tensors
         tf.disposeVariables();
         
         if (videoElement && videoElement.srcObject) {
@@ -453,13 +391,13 @@ window.onload = function() {
         calibrateBtn.style.display = "none";
         statusDiv.innerHTML = "Stopped";
         statusDiv.style.background = "#f4f4f4";
-        statusDiv.className = "";
         debugDiv.innerHTML = "Debug: Stopped";
         
         frameCount = 0;
         lastSentCommand = "";
         objectPresent = false;
-        stableFrameCount = 0;
+        
+        console.log("Stopped - Memory info:", tf.memory());
     }
 };
 </script>
